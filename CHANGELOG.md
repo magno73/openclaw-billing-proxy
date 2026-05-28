@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### macOS launchd + Keychain refresh hardening
+
+**Changes:**
+- Documented the production macOS LaunchAgent for OpenClaw: `ai.openclaw.claude-proxy` must run `proxy.js` from `openclaw-billing-proxy`.
+- Documented that `com.cursor-claude-connector` is not suitable for OpenClaw full-tool traffic because it lacks the OpenClaw detection bypass layers and can trigger misleading "out of extra usage" errors.
+- Hardened token loading on macOS: read Claude Code OAuth from Keychain first, fall back to the credentials file, cache until near expiry, and retry once after 401 with a fresh Keychain read.
+
+---
+
 ## v2.2.4 -- 2026-04-09
 
 ### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)

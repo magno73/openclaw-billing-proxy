@@ -418,18 +418,61 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
-function getToken(credsPath) {
+// Source of truth: macOS Keychain (`Claude Code-credentials`). Claude Code
+// rotates the token there ~every 8h; the on-disk file is rarely up to date.
+// We cache in memory to avoid spawning `security` per request and re-read
+// from Keychain when the cached token is within ~5 min of expiry.
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+const TOKEN_REFRESH_LEEWAY_MS = 5 * 60 * 1000;
+let _tokenCache = null;
+
+function _readKeychainOauth() {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const { execSync } = require('child_process');
+    for (const svc of KEYCHAIN_SERVICES) {
+      try {
+        let raw = execSync(
+          'security find-generic-password -s "' + svc + '" -w 2>/dev/null',
+          { encoding: 'utf8' }
+        );
+        if (!raw) continue;
+        raw = raw.trim();
+        if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+        const creds = JSON.parse(raw);
+        if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+          return creds.claudeAiOauth;
+        }
+      } catch (e) {}
+    }
+  } catch (e) { return null; }
+  return null;
+}
+
+function _readFileOauth(credsPath) {
+  try {
+    let raw = fs.readFileSync(credsPath, 'utf8');
+    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+    const creds = JSON.parse(raw);
+    return (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) ? creds.claudeAiOauth : null;
+  } catch (e) { return null; }
+}
+
+function getToken(credsPath, force) {
   // Env var mode: return synthetic OAuth object without file I/O
   if (credsPath === 'env') {
     const token = process.env.OAUTH_TOKEN;
     if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
     return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
   }
-  let raw = fs.readFileSync(credsPath, 'utf8');
-  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
-  const creds = JSON.parse(raw);
-  const oauth = creds.claudeAiOauth;
-  if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+  const now = Date.now();
+  if (!force && _tokenCache && _tokenCache.oauth) {
+    const expAt = _tokenCache.oauth.expiresAt || 0;
+    if (expAt - now > TOKEN_REFRESH_LEEWAY_MS) return _tokenCache.oauth;
+  }
+  let oauth = _readKeychainOauth() || _readFileOauth(credsPath);
+  if (!oauth) throw new Error('No OAuth token in Keychain or file. Run "claude auth login".');
+  _tokenCache = { oauth };
   return oauth;
 }
 
@@ -819,126 +862,143 @@ function startServer(config) {
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
-      const upstream = https.request({
-        hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
-      }, (upRes) => {
-        const status = upRes.statusCode;
-        console.log(`[${ts}] #${reqNum} > ${status}`);
-        if (status !== 200 && status !== 201) {
-          const errChunks = [];
-          upRes.on('data', c => errChunks.push(c));
-          upRes.on('end', () => {
-            let errBody = Buffer.concat(errChunks).toString();
-            if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
-            }
-            errBody = reverseMap(errBody, config);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding']; // avoid conflict with content-length
-            nh['content-length'] = Buffer.byteLength(errBody);
-            res.writeHead(status, nh);
-            res.end(errBody);
-          });
-          return;
-        }
-        // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
-        // event arrives (terminated by \n\n), then transform per event. This
-        // subsumes the older tail-buffer fix for patterns split across TCP
-        // chunks (#11) because SSE events are self-contained, so patterns
-        // can't span event boundaries. It also lets us track the current
-        // content block type across events and pass thinking/redacted_thinking
-        // bytes through unchanged — Anthropic rejects the next turn otherwise
-        // with "thinking blocks in the latest assistant message cannot be
-        // modified."
-        if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          const sseHeaders = { ...upRes.headers };
-          delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
-          delete sseHeaders['transfer-encoding'];   // avoid header conflicts
-          res.writeHead(status, sseHeaders);
-          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
-          // so multi-byte chars (中文, emoji) that land on a chunk boundary
-          // don't decode as U+FFFD.
-          const decoder = new StringDecoder('utf8');
-          let pending = '';
-          let currentBlockIsThinking = false;
-
-          const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
-
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
+      const sendUpstream = (attempt) => {
+        const upstream = https.request({
+          hostname: UPSTREAM_HOST, port: 443,
+          path: req.url, method: req.method, headers
+        }, (upRes) => {
+          const status = upRes.statusCode;
+          console.log(`[${ts}] #${reqNum} > ${status}${attempt > 1 ? ' (retry)' : ''}`);
+          if (status !== 200 && status !== 201) {
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', () => {
+              let errBody = Buffer.concat(errChunks).toString();
+              // On 401, force re-read Keychain (Claude Code may have rotated the token) and retry once
+              if (status === 401 && attempt === 1) {
+                try {
+                  const fresh = getToken(config.credsPath, true);
+                  if (fresh && fresh.accessToken && fresh.accessToken !== oauth.accessToken) {
+                    console.log(`[${ts}] #${reqNum} 401 -> refreshed token from Keychain, retrying`);
+                    oauth = fresh;
+                    headers['authorization'] = `Bearer ${oauth.accessToken}`;
+                    sendUpstream(2);
+                    return;
+                  }
+                } catch (e) { /* fall through */ }
               }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
-            }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
-            }
-            return reverseMap(event, config);
-          };
+              if (errBody.includes('extra usage')) {
+                console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              }
+              errBody = reverseMap(errBody, config);
+              const nh = { ...upRes.headers };
+              delete nh['transfer-encoding']; // avoid conflict with content-length
+              nh['content-length'] = Buffer.byteLength(errBody);
+              res.writeHead(status, nh);
+              res.end(errBody);
+            });
+            return;
+          }
+          // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
+          // event arrives (terminated by \n\n), then transform per event. This
+          // subsumes the older tail-buffer fix for patterns split across TCP
+          // chunks (#11) because SSE events are self-contained, so patterns
+          // can't span event boundaries. It also lets us track the current
+          // content block type across events and pass thinking/redacted_thinking
+          // bytes through unchanged — Anthropic rejects the next turn otherwise
+          // with "thinking blocks in the latest assistant message cannot be
+          // modified."
+          if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
+            const sseHeaders = { ...upRes.headers };
+            delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
+            delete sseHeaders['transfer-encoding'];   // avoid header conflicts
+            res.writeHead(status, sseHeaders);
+            // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
+            // so multi-byte chars (中文, emoji) that land on a chunk boundary
+            // don't decode as U+FFFD.
+            const decoder = new StringDecoder('utf8');
+            let pending = '';
+            let currentBlockIsThinking = false;
 
-          upRes.on('data', (chunk) => {
-            pending += decoder.write(chunk);
-            let sepIdx;
-            while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
-              const event = pending.slice(0, sepIdx + 2);
-              pending = pending.slice(sepIdx + 2);
-              res.write(transformEvent(event));
-            }
-          });
-          upRes.on('end', () => {
-            pending += decoder.end();
-            if (pending.length > 0) {
-              // Trailing bytes with no terminator — shouldn't happen in
-              // well-formed SSE, but flush to avoid silent drops.
-              res.write(transformEvent(pending));
-            }
-            res.end();
-          });
-        } else {
-          const respChunks = [];
-          upRes.on('data', c => respChunks.push(c));
-          upRes.on('end', () => {
-            let respBody = Buffer.concat(respChunks).toString();
-            // Mask thinking blocks so reverseMap can't mutate them. The client
-            // stores these bytes and echoes them on the next turn; Anthropic
-            // enforces byte-equality on the latest assistant message.
-            const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
-            respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding']; // avoid conflict with content-length
-            nh['content-length'] = Buffer.byteLength(respBody);
-            res.writeHead(status, nh);
-            res.end(respBody);
-          });
-        }
-      });
-      upstream.on('error', e => {
-        console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
-        }
-      });
-      upstream.write(body);
-      upstream.end();
+            const transformEvent = (event) => {
+              // Locate the data: line (always at the start of an SSE line)
+              let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+              if (dataIdx === -1) return reverseMap(event, config);
+              if (dataIdx > 0) dataIdx += 1; // skip the leading \n
+              const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+              const dataStr = dataLineEnd === -1
+                ? event.slice(dataIdx + 6)
+                : event.slice(dataIdx + 6, dataLineEnd);
+
+              if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
+                if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
+                    dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
+                  currentBlockIsThinking = true;
+                  return event; // pass through unchanged
+                }
+                currentBlockIsThinking = false;
+                return reverseMap(event, config);
+              }
+              if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+                const wasThinking = currentBlockIsThinking;
+                currentBlockIsThinking = false;
+                return wasThinking ? event : reverseMap(event, config);
+              }
+              if (currentBlockIsThinking) {
+                // thinking_delta / signature_delta / etc. inside a thinking block
+                return event;
+              }
+              return reverseMap(event, config);
+            };
+
+            upRes.on('data', (chunk) => {
+              pending += decoder.write(chunk);
+              let sepIdx;
+              while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+                const event = pending.slice(0, sepIdx + 2);
+                pending = pending.slice(sepIdx + 2);
+                res.write(transformEvent(event));
+              }
+            });
+            upRes.on('end', () => {
+              pending += decoder.end();
+              if (pending.length > 0) {
+                // Trailing bytes with no terminator — shouldn't happen in
+                // well-formed SSE, but flush to avoid silent drops.
+                res.write(transformEvent(pending));
+              }
+              res.end();
+            });
+          } else {
+            const respChunks = [];
+            upRes.on('data', c => respChunks.push(c));
+            upRes.on('end', () => {
+              let respBody = Buffer.concat(respChunks).toString();
+              // Mask thinking blocks so reverseMap can't mutate them. The client
+              // stores these bytes and echoes them on the next turn; Anthropic
+              // enforces byte-equality on the latest assistant message.
+              const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
+              respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
+              const nh = { ...upRes.headers };
+              delete nh['transfer-encoding']; // avoid conflict with content-length
+              nh['content-length'] = Buffer.byteLength(respBody);
+              res.writeHead(status, nh);
+              res.end(respBody);
+            });
+          }
+        });
+        upstream.on('error', e => {
+          console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+          }
+        });
+        upstream.write(body);
+        upstream.end();
+      };
+
+      sendUpstream(1);
     });
   });
 

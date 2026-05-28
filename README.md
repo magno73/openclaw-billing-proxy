@@ -187,6 +187,60 @@ See `.env.example` for all available environment variables.
 
 > **Note:** macOS Keychain credential extraction does not work inside Docker. Use the `~/.claude` volume mount (default) or set `OAUTH_TOKEN` in `.env`.
 
+### macOS (launchd)
+For OpenClaw on Marco's Mac mini, the production service is:
+
+- Label: `ai.openclaw.claude-proxy`
+- Working directory: `/Users/magnus-bot/openclaw-billing-proxy`
+- Command: `/opt/homebrew/bin/node proxy.js`
+- Port: `18801`
+
+Example LaunchAgent:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.claude-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>proxy.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/magnus-bot</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/opt/node/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PORT</key>
+    <string>18801</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/magnus-bot/openclaw-billing-proxy</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/magnus-bot/.openclaw/logs/claude-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/magnus-bot/.openclaw/logs/claude-proxy.log</string>
+</dict>
+</plist>
+```
+
+Operational checks:
+
+```bash
+launchctl print gui/$(id -u)/ai.openclaw.claude-proxy | sed -n '1,60p'
+curl -sS http://127.0.0.1:18801/health | jq '{status,proxy,version,subscriptionType,tokenExpiresInHours}'
+```
+
+If an older `com.cursor-claude-connector` LaunchAgent exists, keep it disabled for OpenClaw. That proxy can forward requests but does not apply the OpenClaw detection bypass layers, so full-tool requests can fail with misleading "out of extra usage" billing errors.
+
 ### Linux (systemd)
 ```bash
 sudo tee /etc/systemd/system/openclaw-proxy.service << EOF
@@ -222,10 +276,19 @@ pm2 save
 
 ## Token Refresh
 
-Claude Code's OAuth token expires every ~24 hours. The proxy reads the token fresh from disk on each request. To refresh:
+Claude Code rotates OAuth tokens. On macOS the source of truth is usually Keychain (`Claude Code-credentials`), while the on-disk credentials file may be stale. The proxy reads Keychain first, falls back to the file, caches the token until it is close to expiry, and retries once after a 401 by forcing a fresh Keychain read.
+
+To refresh manually:
 
 - **Easiest**: Open Claude Code CLI briefly -- it auto-refreshes on startup
 - **Automated**: Set up a cron that runs `claude -p "ping" --max-turns 1 --no-session-persistence` daily (triggers auth refresh)
+
+After a power outage or sleep/wake issue:
+
+```bash
+claude -p "ping" --max-turns 1 --no-session-persistence
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.claude-proxy
+```
 
 ## Health Check
 
@@ -291,6 +354,7 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 **Proxy returns 400 "out of extra usage" (v2)**
 - If you upgraded from v1.x: the old string-only sanitization no longer works. You need v2.0's full 7-layer processing. Make sure you're running the new `proxy.js`.
 - Check `/health` endpoint -- it should show `version: "2.0.0"` and `layers` object.
+- On macOS, check launchd is running this proxy, not `cursor-claude-connector`: `launchctl print gui/$(id -u)/ai.openclaw.claude-proxy`.
 - If v2 is running and still failing: your OpenClaw version may have new tools not in the default rename list. Check the proxy console for `DETECTION!` log lines. Add custom tool renames to `config.json`.
 - If it was working and stopped: Anthropic may have added new detection. Check the repo for updates.
 
